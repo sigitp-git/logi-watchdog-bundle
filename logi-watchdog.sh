@@ -1,0 +1,97 @@
+#!/bin/bash
+#
+# logi-watchdog.sh
+# Keeps the Logi Options+ agent (which handles MX Master custom buttons)
+# alive. Detects both a MISSING agent and a HUNG agent (state Z/T/U that
+# Logitech's own KeepAlive=SuccessfulExit does NOT catch, since a hung
+# process has not "exited").
+#
+# Installed as a user LaunchAgent; requires no admin rights.
+# Portable: uses $HOME, so it works for any macOS user.
+
+set -u
+
+AGENT_NAME="logioptionsplus_agent"
+AGENT_BIN="/Library/Application Support/Logitech.localized/LogiOptionsPlus/logioptionsplus_agent.app/Contents/MacOS/logioptionsplus_agent"
+LOG_DIR="$HOME/Library/Logs/LogiWatchdog"
+LOG_FILE="$LOG_DIR/logi-watchdog.log"
+MAX_LOG_BYTES=1048576   # 1 MiB, then rotate
+
+mkdir -p "$LOG_DIR"
+
+log() {
+    printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG_FILE"
+}
+
+# Post a native macOS notification. Best-effort: never fails the script.
+notify() {
+    local title="$1"
+    local message="$2"
+    /usr/bin/osascript -e "display notification \"${message//\"/\\\"}\" with title \"${title//\"/\\\"}\" sound name \"Submarine\"" >/dev/null 2>&1 || true
+}
+
+rotate_log() {
+    if [ -f "$LOG_FILE" ]; then
+        local size
+        size=$(stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
+        if [ "$size" -gt "$MAX_LOG_BYTES" ]; then
+            mv -f "$LOG_FILE" "$LOG_FILE.1"
+        fi
+    fi
+}
+
+restart_agent() {
+    local reason="$1"
+    log "RESTART triggered ($reason). Killing any existing agent and relaunching."
+
+    pkill -x "$AGENT_NAME" 2>/dev/null
+    sleep 2
+    if pgrep -x "$AGENT_NAME" >/dev/null 2>&1; then
+        pkill -9 -x "$AGENT_NAME" 2>/dev/null
+        sleep 1
+    fi
+
+    if [ ! -x "$AGENT_BIN" ]; then
+        log "ERROR: agent binary not found/executable at: $AGENT_BIN"
+        notify "Logi Options+ watchdog" "Agent binary not found. Is Logi Options+ installed?"
+        return 1
+    fi
+
+    nohup "$AGENT_BIN" --launchd >/dev/null 2>&1 &
+    disown 2>/dev/null
+    sleep 2
+
+    if pgrep -x "$AGENT_NAME" >/dev/null 2>&1; then
+        log "OK: agent is running again (pid $(pgrep -x "$AGENT_NAME" | tr '\n' ' '))."
+        notify "Logi Options+ recovered" "The mouse agent had stopped ($reason) and was restarted. Your custom buttons should work again."
+    else
+        log "WARN: agent did not come back after restart attempt."
+        notify "Logi Options+ restart failed" "The mouse agent stopped ($reason) but could not be restarted. You may need to reopen Logi Options+ manually."
+    fi
+}
+
+rotate_log
+
+pids=$(pgrep -x "$AGENT_NAME")
+
+if [ -z "$pids" ]; then
+    restart_agent "agent not running"
+    exit 0
+fi
+
+hung=0
+for pid in $pids; do
+    stat=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')
+    case "$stat" in
+        Z*|T*) hung=1 ;;
+        U*)    hung=1 ;;
+        *)     : ;;
+    esac
+done
+
+if [ "$hung" -eq 1 ]; then
+    restart_agent "agent hung (state=$stat)"
+    exit 0
+fi
+
+exit 0
